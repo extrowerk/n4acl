@@ -44,6 +44,9 @@ pub fn lint(acl: &[Ace], cx: &Ctx) -> Vec<Lint> {
         if !cx.is_dir && a.has(FILE_INHERIT | DIR_INHERIT | INHERIT_ONLY | NO_PROPAGATE) {
             w(Severity::Warn, Some(i), format!("#{n}: inheritance flags have no meaning on a file; ZFS may reject them"));
         }
+        if !cx.is_dir && a.mask & DELETE_CHILD != 0 && a.kind == AceType::Allow {
+            w(Severity::Info, Some(i), format!("#{n}: D (delete_child) only matters on directories"));
+        }
         if cx.is_dir && a.has(INHERIT_ONLY) && !a.has(FLAG_INHERIT_ANY) {
             w(Severity::Warn, Some(i), format!("#{n} is inherit-only (i) but has no f/d: it never applies anywhere"));
         }
@@ -123,7 +126,7 @@ pub fn lint(acl: &[Ace], cx: &Ctx) -> Vec<Lint> {
             _ => {}
         }
     }
-    out.sort_by(|a, b| b.sev.cmp(&a.sev));
+    out.sort_by_key(|l| std::cmp::Reverse(l.sev));
     out
 }
 
@@ -138,6 +141,23 @@ pub enum Decision {
 pub struct Subject {
     pub uid: u32,
     pub gids: Vec<u32>,
+}
+
+impl Subject {
+    /// `name`, `uid`, or `user:group,group…` (names or numbers). Without an
+    /// explicit group list, the groups come from the id context.
+    pub fn parse(input: &str, ids: &IdDb) -> Result<Self, String> {
+        let (u, g) = match input.trim().split_once(':') {
+            Some((u, g)) => (u, Some(g)),
+            None => (input.trim(), None),
+        };
+        let uid = resolve_user(u, ids)?;
+        let gids = match g {
+            Some(g) => g.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|x| resolve_group(x, ids)).collect::<Result<_, _>>()?,
+            None => ids.user_groups(uid),
+        };
+        Ok(Subject { uid, gids })
+    }
 }
 
 fn matches(who: Who, s: &Subject, fuid: u32, fgid: u32) -> bool {

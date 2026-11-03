@@ -5,9 +5,11 @@ use crate::ace::{self, Ace, INHERITED};
 use crate::ids::IdDb;
 use crate::model;
 use crate::sys;
-use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
-use std::os::unix::fs::MetadataExt;
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -22,8 +24,8 @@ impl Scope {
     pub fn label(self) -> &'static str {
         match self {
             Scope::This => "this item only",
-            Scope::Replace => "recursive: same ACL everywhere (files get it without inheritance flags)",
-            Scope::Repropagate => "recursive: keep each child's own entries, refresh the inherited (I) ones",
+            Scope::Replace => "recursive: same ACL on everything below",
+            Scope::Repropagate => "recursive: keep children's own entries, refresh inherited",
         }
     }
 }
@@ -32,23 +34,81 @@ impl Scope {
 pub struct Report {
     pub changed: usize,
     pub unchanged: usize,
+    /// symlinks, special files and other datasets that were not touched
+    pub skipped: usize,
     pub errors: Vec<(PathBuf, String)>,
     pub samples: Vec<(PathBuf, usize, usize)>,
     pub backup: Option<PathBuf>,
 }
 
+/// Paths are stored byte-exact: printable ASCII as-is, everything else as \xHH.
+fn escape_path(p: &Path) -> String {
+    let mut s = String::new();
+    for &b in p.as_os_str().as_bytes() {
+        if (0x21..0x7f).contains(&b) && b != b'\\' {
+            s.push(b as char);
+        } else {
+            s.push_str(&format!("\\x{b:02x}"));
+        }
+    }
+    s
+}
+
+fn unescape_path(s: &str) -> Option<PathBuf> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            let hex = s.get(i + 2..i + 4)?;
+            if b.get(i + 1) != Some(&b'x') {
+                return None;
+            }
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Some(PathBuf::from(OsStr::from_bytes(&out)))
+}
+
 struct Backup {
-    w: BufWriter<File>,
+    f: File,
     ids: IdDb,
+    records: usize,
 }
 
 impl Backup {
-    fn record(&mut self, p: &Path, acl: &[Ace]) -> io::Result<()> {
-        let esc = p.to_string_lossy().replace('\\', "\\\\").replace('\n', "\\n");
-        writeln!(self.w, "path {esc}")?;
-        for a in acl {
-            writeln!(self.w, "  {}", ace::ace_text(a, &self.ids, true))?;
+    fn create(dir: &Path) -> io::Result<(Self, PathBuf)> {
+        fs::create_dir_all(dir)?;
+        let base = format!("backup-{}", stamp());
+        for n in 0..100 {
+            let name = if n == 0 { format!("{base}.acl") } else { format!("{base}-{n}.acl") };
+            let path = dir.join(name);
+            match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+                Ok(mut f) => {
+                    writeln!(f, "# n4acl backup {} - numeric ids. Restore with: n4acl --restore {}", stamp(), path.display())?;
+                    return Ok((Backup { f, ids: IdDb::numeric(), records: 0 }, path));
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
         }
+        Err(io::Error::other("too many backups with the same timestamp"))
+    }
+
+    /// Written and flushed before the ACL is changed, so an interrupted run
+    /// can always be undone.
+    fn record(&mut self, p: &Path, acl: &[Ace]) -> io::Result<()> {
+        let mut s = format!("path {}\n", escape_path(p));
+        for a in acl {
+            s.push_str(&format!("  {}\n", ace::ace_text(a, &self.ids, true)));
+        }
+        self.f.write_all(s.as_bytes())?;
+        self.f.flush()?;
+        self.records += 1;
         Ok(())
     }
 }
@@ -86,105 +146,132 @@ pub struct Job<'a> {
     pub backup: bool,
 }
 
+struct Walker<'a> {
+    job: &'a Job<'a>,
+    dev: u64,
+    rep: Report,
+    bk: Option<Backup>,
+}
+
 pub fn run(job: &Job) -> Report {
     let mut rep = Report::default();
+    let dev = match fs::metadata(job.root) {
+        Ok(m) => m.dev(),
+        Err(e) => {
+            rep.errors.push((job.root.to_path_buf(), e.to_string()));
+            return rep;
+        }
+    };
     let mut bk = None;
     if job.backup && !job.dry_run {
-        let dir = backup_dir();
-        let path = dir.join(format!("backup-{}.acl", stamp()));
-        let opened = fs::create_dir_all(&dir).and_then(|_| File::create(&path));
-        match opened {
-            Ok(f) => {
-                let mut w = BufWriter::new(f);
-                let _ = writeln!(w, "# n4acl backup {} — numeric ids. Restore with: n4acl --restore {}", stamp(), path.display());
-                bk = Some(Backup { w, ids: IdDb::numeric() });
+        match Backup::create(&backup_dir()) {
+            Ok((b, path)) => {
+                bk = Some(b);
                 rep.backup = Some(path);
             }
             Err(e) => {
-                rep.errors.push((path, format!("cannot create backup: {e}; nothing written")));
+                rep.errors.push((backup_dir(), format!("cannot create backup ({e}); nothing was written")));
                 return rep;
             }
         }
     }
-    let dev = fs::symlink_metadata(job.root).map(|m| m.dev()).unwrap_or(0);
-    apply_one(job, job.root, job.acl.to_vec(), &mut rep, &mut bk);
-    if job.scope != Scope::This {
-        walk(job, job.root, job.acl, dev, &mut rep, &mut bk);
+    let mut w = Walker { job, dev, rep, bk };
+    if let Some(old) = w.read(job.root) {
+        w.apply(job.root, old, job.acl.to_vec());
+        if job.scope != Scope::This {
+            w.walk(job.root, job.acl);
+        }
     }
-    if let Some(mut b) = bk {
-        let _ = b.w.flush();
+    let mut rep = w.rep;
+    if let (Some(b), Some(p)) = (&w.bk, &rep.backup)
+        && b.records == 0
+    {
+        let _ = fs::remove_file(p); // nothing changed: do not leave empty backups
+        rep.backup = None;
     }
     rep
 }
 
-fn apply_one(job: &Job, p: &Path, new: Vec<Ace>, rep: &mut Report, bk: &mut Option<Backup>) {
-    let old = match sys::get_acl(p) {
-        Ok(o) => o,
-        Err(e) => {
-            rep.errors.push((p.to_path_buf(), sys::io_msg(&e)));
-            return;
-        }
-    };
-    if old == new {
-        rep.unchanged += 1;
-        return;
+impl Walker<'_> {
+    fn err(&mut self, p: &Path, e: impl ToString) {
+        self.rep.errors.push((p.to_path_buf(), e.to_string()));
     }
-    if rep.samples.len() < 12 {
-        rep.samples.push((p.to_path_buf(), old.len(), new.len()));
-    }
-    if job.dry_run {
-        rep.changed += 1;
-        return;
-    }
-    if let Some(b) = bk
-        && let Err(e) = b.record(p, &old)
-    {
-        rep.errors.push((p.to_path_buf(), format!("backup write failed, skipped: {e}")));
-        return;
-    }
-    match sys::set_acl(p, &new) {
-        Ok(()) => rep.changed += 1,
-        Err(e) => rep.errors.push((p.to_path_buf(), sys::io_msg(&e))),
-    }
-}
 
-fn walk(job: &Job, dir: &Path, dir_acl: &[Ace], dev: u64, rep: &mut Report, bk: &mut Option<Backup>) {
-    let rd = match fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(e) => {
-            rep.errors.push((dir.to_path_buf(), e.to_string()));
+    fn read(&mut self, p: &Path) -> Option<Vec<Ace>> {
+        sys::get_acl(p).map_err(|e| self.err(p, e)).ok()
+    }
+
+    fn apply(&mut self, p: &Path, old: Vec<Ace>, new: Vec<Ace>) {
+        if old == new {
+            self.rep.unchanged += 1;
             return;
         }
-    };
-    let mut entries: Vec<_> = rd.filter_map(Result::ok).map(|e| e.path()).collect();
-    entries.sort();
-    for p in entries {
-        let Ok(md) = fs::symlink_metadata(&p) else { continue };
-        let ft = md.file_type();
-        if ft.is_symlink() || md.dev() != dev || !(ft.is_dir() || ft.is_file()) {
-            continue; // never follow symlinks or cross into other datasets
+        if self.rep.samples.len() < 12 {
+            self.rep.samples.push((p.to_path_buf(), old.len(), new.len()));
         }
-        let is_dir = ft.is_dir();
-        let new = match job.scope {
-            Scope::This => unreachable!(),
-            Scope::Replace => {
-                if is_dir { dir_acl.to_vec() } else { model::for_file(dir_acl) }
-            }
-            Scope::Repropagate => {
-                let mut own: Vec<Ace> = match sys::get_acl(&p) {
-                    Ok(o) => o.into_iter().filter(|a| !a.has(INHERITED)).collect(),
-                    Err(e) => {
-                        rep.errors.push((p.clone(), sys::io_msg(&e)));
-                        continue;
+        if self.job.dry_run {
+            self.rep.changed += 1;
+            return;
+        }
+        if let Some(b) = &mut self.bk
+            && let Err(e) = b.record(p, &old)
+        {
+            self.err(p, format!("backup write failed, not changed: {e}"));
+            return;
+        }
+        match sys::set_acl(p, &new) {
+            Ok(()) => self.rep.changed += 1,
+            Err(e) => self.err(p, e),
+        }
+    }
+
+    fn walk(&mut self, dir: &Path, dir_acl: &[Ace]) {
+        let mut entries = Vec::new();
+        match fs::read_dir(dir) {
+            Ok(rd) => {
+                for e in rd {
+                    match e {
+                        Ok(e) => entries.push(e.path()),
+                        Err(e) => self.err(dir, e),
                     }
-                };
-                own.extend(model::inherit(dir_acl, is_dir, job.aclinherit));
-                own
+                }
             }
-        };
-        apply_one(job, &p, new.clone(), rep, bk);
-        if is_dir {
-            walk(job, &p, &new, dev, rep, bk);
+            Err(e) => return self.err(dir, e),
+        }
+        entries.sort();
+        for p in entries {
+            let md = match fs::symlink_metadata(&p) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.err(&p, e);
+                    continue;
+                }
+            };
+            let ft = md.file_type();
+            if ft.is_symlink() || md.dev() != self.dev || !(ft.is_dir() || ft.is_file()) {
+                self.rep.skipped += 1; // never follow symlinks or cross into other datasets
+                continue;
+            }
+            let is_dir = ft.is_dir();
+            let Some(old) = self.read(&p) else { continue };
+            let new = match self.job.scope {
+                Scope::This => unreachable!(),
+                Scope::Replace if is_dir => dir_acl.to_vec(),
+                Scope::Replace => model::for_file(dir_acl),
+                Scope::Repropagate => {
+                    let mut own: Vec<Ace> = old.iter().filter(|a| !a.has(INHERITED)).copied().collect();
+                    own.extend(model::inherit(dir_acl, is_dir, self.job.aclinherit));
+                    own
+                }
+            };
+            if new.is_empty() {
+                self.err(&p, "would end up with an empty ACL; left unchanged");
+                continue;
+            }
+            self.apply(&p, old, new.clone());
+            if is_dir {
+                self.walk(&p, &new);
+            }
         }
     }
 }
@@ -194,38 +281,27 @@ pub fn restore(file: &Path) -> io::Result<(usize, Vec<(PathBuf, String)>)> {
     let text = fs::read_to_string(file)?;
     let ids = IdDb::numeric();
     let mut items: Vec<(PathBuf, String)> = Vec::new();
-    for line in text.lines() {
+    for (n, line) in text.lines().enumerate() {
         if let Some(p) = line.strip_prefix("path ") {
-            let mut s = String::new();
-            let mut it = p.chars();
-            while let Some(c) = it.next() {
-                if c == '\\' {
-                    match it.next() {
-                        Some('n') => s.push('\n'),
-                        Some(o) => s.push(o),
-                        None => {}
-                    }
-                } else {
-                    s.push(c);
-                }
-            }
-            items.push((PathBuf::from(s), String::new()));
+            let path = unescape_path(p).ok_or_else(|| io::Error::other(format!("line {}: bad path", n + 1)))?;
+            items.push((path, String::new()));
         } else if let Some(last) = items.last_mut()
             && line.starts_with("  ")
         {
             last.1.push_str(line.trim());
             last.1.push('\n');
+        } else if !line.starts_with('#') && !line.trim().is_empty() {
+            return Err(io::Error::other(format!("line {}: not an n4acl backup line", n + 1)));
         }
     }
     let (mut ok, mut errs) = (0, Vec::new());
-    // reverse order: if a path was recorded twice the first record is the oldest
-    for (p, t) in items.iter().rev() {
+    for (p, t) in &items {
         match ace::parse_acl(t, &ids) {
             Ok(acl) => match sys::set_acl(p, &acl) {
                 Ok(()) => ok += 1,
                 Err(e) => errs.push((p.clone(), e.to_string())),
             },
-            Err(e) => errs.push((p.clone(), format!("{e:?}"))),
+            Err(e) => errs.push((p.clone(), e.into_iter().map(|(_, m)| m).collect::<Vec<_>>().join("; "))),
         }
     }
     Ok((ok, errs))
@@ -235,6 +311,15 @@ pub fn restore(file: &Path) -> io::Result<(usize, Vec<(PathBuf, String)>)> {
 mod tests {
     use super::*;
     use crate::ace::parse_acl;
+
+    #[test]
+    fn path_escaping() {
+        let p = PathBuf::from(OsStr::from_bytes(b"/a b/\\x/\n\xff\xc3\xa9"));
+        let e = escape_path(&p);
+        assert!(!e.contains(' ') && !e.contains('\n'));
+        assert_eq!(unescape_path(&e).unwrap(), p);
+        assert!(unescape_path("bad\\q1").is_none());
+    }
 
     #[test]
     fn recursive_apply_and_restore() {

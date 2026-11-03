@@ -25,7 +25,8 @@ id context (how names are shown and resolved):
   -n                  numeric ids only, never resolve names
 
 non-interactive:
-  --dump              print the ACL in chmod A= syntax (numeric with -n)
+  --dump              print the ACL in chmod A= syntax (numeric ids unless
+                      names are resolved in the global zone)
   --explain           explain every entry in plain language and run checks
   --test WHO          effective access for WHO = name | uid | uid:gid,gid…
   --restore FILE      re-apply ACLs saved in a backup file
@@ -137,8 +138,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let numeric = matches!(src, Source::Numeric);
     let ids = IdDb::load(src);
+    if let Some(w) = &ids.warning {
+        eprintln!("n4acl: warning: {w}");
+    }
+    // Names only mean the same thing to chmod in the global zone; anywhere
+    // else --dump prints ids so the output can be fed back safely.
+    let numeric = !ids.is_global();
     let acl = match sys::get_acl(&path) {
         Ok(a) => a,
         Err(e) => {
@@ -173,32 +179,15 @@ fn main() -> ExitCode {
             }
         }
         if let Some(who) = &o.test {
-            let (u, g) = who.split_once(':').map(|(a, b)| (a, Some(b))).unwrap_or((who.as_str(), None));
-            let uid = match ace::resolve_user(u, &ids) {
-                Ok(x) => x,
+            let subj = match model::Subject::parse(who, &ids) {
+                Ok(s) => s,
                 Err(e) => {
                     eprintln!("n4acl: {e}");
                     return ExitCode::from(2);
                 }
             };
-            let gids = match g {
-                Some(g) => {
-                    let mut v = Vec::new();
-                    for x in g.split(',').filter(|s| !s.is_empty()) {
-                        match ace::resolve_group(x, &ids) {
-                            Ok(id) => v.push(id),
-                            Err(e) => {
-                                eprintln!("n4acl: {e}");
-                                return ExitCode::from(2);
-                            }
-                        }
-                    }
-                    v
-                }
-                None => ids.user_groups(uid),
-            };
-            println!("uid {uid} groups {gids:?}");
-            for (p, d) in model::evaluate(&acl, &model::Subject { uid, gids }, target.uid, target.gid) {
+            println!("uid {} groups {:?}", subj.uid, subj.gids);
+            for (p, d) in model::evaluate(&acl, &subj, target.uid, target.gid) {
                 let s = match d {
                     model::Decision::Allowed(i) => format!("allow  (#{})", i + 1),
                     model::Decision::Denied(i) => format!("DENY   (#{})", i + 1),

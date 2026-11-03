@@ -59,16 +59,16 @@ pub const PERMS: [PermInfo; 14] = [
         file: "modify contents", dir: "create files",
         hint: "Overwrite/modify file data, or create new files in a directory." },
     PermInfo { ch: 'x', bit: EXECUTE, name: "execute", alt: "",
-        file: "execute", dir: "traverse (cd into)",
+        file: "execute", dir: "traverse (cd)",
         hint: "Run a file, or pass through a directory to reach things below it." },
     PermInfo { ch: 'p', bit: APPEND_DATA, name: "append_data", alt: "add_subdirectory",
-        file: "append", dir: "create subdirectories",
+        file: "append", dir: "create subdirs",
         hint: "Append to a file (without overwriting), or create subdirectories." },
     PermInfo { ch: 'd', bit: DELETE, name: "delete", alt: "",
         file: "delete it", dir: "delete it",
         hint: "Delete this item itself. Deletion is also allowed if the parent grants D (delete_child)." },
     PermInfo { ch: 'D', bit: DELETE_CHILD, name: "delete_child", alt: "",
-        file: "delete child (dirs)", dir: "delete items inside",
+        file: "n/a on files", dir: "delete children",
         hint: "Directories: delete/rename any entry inside, even without d on that entry." },
     PermInfo { ch: 'a', bit: READ_ATTRIBUTES, name: "read_attributes", alt: "",
         file: "read attributes", dir: "read attributes",
@@ -248,7 +248,7 @@ impl Ace {
     }
 
     /// (a_who, a_access_mask, a_flags, a_type)
-    pub fn to_raw(&self) -> (u32, u32, u16, u16) {
+    pub fn to_raw(self) -> (u32, u32, u16, u16) {
         let (who, wflags) = match self.who {
             Who::Owner => (u32::MAX, ACE_OWNER),
             Who::Group => (u32::MAX, ACE_GROUP | IDENTIFIER_GROUP),
@@ -308,6 +308,7 @@ pub fn who_display(who: Who, ids: &IdDb, mode: NameMode) -> String {
     }
     match (mode, name) {
         (NameMode::Id, _) => format!("{tag}:{id}"),
+        (_, None) if matches!(ids.source, crate::ids::Source::Numeric) => format!("{tag}:{id}"),
         (NameMode::Name, Some(n)) => format!("{tag}:{n}"),
         (NameMode::Both, Some(n)) => format!("{tag}:{id} ({n})"),
         (_, None) => format!("{tag}:{id} ?"),
@@ -409,26 +410,17 @@ pub fn resolve_group(s: &str, ids: &IdDb) -> Result<u32, String> {
 
 /// Parse one ACE in chmod A syntax. Flags field may be omitted.
 pub fn parse_ace(line: &str, ids: &IdDb) -> Result<Ace, String> {
-    let parts: Vec<&str> = line.trim().split(':').collect();
+    let parts: Vec<&str> = line.trim().split(':').map(str::trim).collect();
     let (who, rest): (Who, &[&str]) = match parts.first().copied() {
         Some("owner@") => (Who::Owner, &parts[1..]),
         Some("group@") => (Who::Group, &parts[1..]),
         Some("everyone@") => (Who::Everyone, &parts[1..]),
-        Some(t @ ("user" | "group" | "usersid" | "groupsid")) => {
+        Some(t @ ("user" | "group")) => {
             let Some(name) = parts.get(1) else { return Err("missing principal".into()) };
-            let w = match t {
-                "user" => Who::User(resolve_user(name, ids)?),
-                "group" => Who::GroupId(resolve_group(name, ids)?),
-                _ => {
-                    // SIDs are read-only in v1; only accept the numeric ephemeral id
-                    let n = parse_numeric(name)
-                        .filter(|n| *n >= EPHEMERAL_MIN)
-                        .ok_or("SID principals are read-only in this version")?;
-                    if t == "usersid" { Who::User(n) } else { Who::GroupId(n) }
-                }
-            };
+            let w = if t == "user" { Who::User(resolve_user(name, ids)?) } else { Who::GroupId(resolve_group(name, ids)?) };
             (w, &parts[2..])
         }
+        Some("usersid" | "groupsid") => return Err("SID principals are not supported; keep the numeric ephemeral id (user:N)".into()),
         Some(other) => return Err(format!("unknown principal type '{other}'")),
         None => return Err("empty entry".into()),
     };
@@ -521,7 +513,7 @@ pub fn explain(ace: &Ace, is_dir: bool, ids: &IdDb, global: Option<&IdDb>) -> Ve
     match ace.kind {
         AceType::Allow => {
             out.push(format!("  Grants: {}", list(&on)));
-            out.push(format!("  Not granted here: {}", list(&off)));
+            out.push(format!("  Not granted by this entry: {}", list(&off)));
         }
         AceType::Deny => out.push(format!("  Denies: {}", list(&on))),
         AceType::Audit | AceType::Alarm => {

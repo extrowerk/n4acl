@@ -12,6 +12,17 @@ pub enum Source {
     Numeric,
 }
 
+impl Source {
+    pub fn describe(&self) -> String {
+        match self {
+            Source::Global => "global zone".into(),
+            Source::Zone { name, .. } => format!("zone {name}"),
+            Source::Files { passwd, .. } => format!("{}", passwd.display()),
+            Source::Numeric => "numeric mode".into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct User {
     name: String,
@@ -31,6 +42,8 @@ pub struct IdDb {
     pub source: Source,
     users: Vec<User>,
     groups: Vec<Group>,
+    /// Set when the passwd/group files of the context could not be read.
+    pub warning: Option<String>,
 }
 
 fn parse_passwd(text: &str) -> Vec<User> {
@@ -60,8 +73,11 @@ fn parse_group(text: &str) -> Vec<Group> {
         .collect()
 }
 
-fn read(p: &Path) -> String {
-    std::fs::read_to_string(p).unwrap_or_default()
+fn read(p: &Path, warn: &mut Option<String>) -> String {
+    std::fs::read_to_string(p).unwrap_or_else(|e| {
+        warn.get_or_insert_with(|| format!("cannot read {}: {e}", p.display()));
+        String::new()
+    })
 }
 
 // --- libc fallbacks for the global zone (picks up LDAP/NIS via nsswitch) ---
@@ -94,20 +110,20 @@ fn sys_group(name: &str) -> Option<u32> {
 
 impl IdDb {
     pub fn numeric() -> Self {
-        IdDb { source: Source::Numeric, users: vec![], groups: vec![] }
+        IdDb { source: Source::Numeric, users: vec![], groups: vec![], warning: None }
     }
 
     pub fn load(source: Source) -> Self {
-        let (users, groups) = match &source {
-            Source::Global => (parse_passwd(&read(Path::new("/etc/passwd"))), parse_group(&read(Path::new("/etc/group")))),
-            Source::Zone { root, .. } => (
-                parse_passwd(&read(&root.join("etc/passwd"))),
-                parse_group(&read(&root.join("etc/group"))),
-            ),
-            Source::Files { passwd, group } => (parse_passwd(&read(passwd)), parse_group(&read(group))),
-            Source::Numeric => (vec![], vec![]),
+        let (pw, gr): (PathBuf, PathBuf) = match &source {
+            Source::Global => ("/etc/passwd".into(), "/etc/group".into()),
+            Source::Zone { root, .. } => (root.join("etc/passwd"), root.join("etc/group")),
+            Source::Files { passwd, group } => (passwd.clone(), group.clone()),
+            Source::Numeric => return Self::numeric(),
         };
-        IdDb { source, users, groups }
+        let mut warning = None;
+        let users = parse_passwd(&read(&pw, &mut warning));
+        let groups = parse_group(&read(&gr, &mut warning));
+        IdDb { source, users, groups, warning }
     }
 
     pub fn is_global(&self) -> bool {
@@ -115,18 +131,13 @@ impl IdDb {
     }
 
     pub fn describe(&self) -> String {
-        match &self.source {
-            Source::Global => "global zone".into(),
-            Source::Zone { name, .. } => format!("zone {name}"),
-            Source::Files { passwd, .. } => format!("{}", passwd.display()),
-            Source::Numeric => "numeric mode".into(),
-        }
+        self.source.describe()
     }
 
     pub fn short(&self) -> String {
         match &self.source {
-            Source::Global => "global".into(),
             Source::Zone { name, .. } => format!("zone {name}"),
+            Source::Global => "global".into(),
             Source::Files { .. } => "files".into(),
             Source::Numeric => "numeric".into(),
         }
@@ -173,7 +184,7 @@ impl IdDb {
         }
         if let Some(n) = name {
             for g in &self.groups {
-                if g.members.iter().any(|m| *m == n) && !out.contains(&g.gid) {
+                if g.members.contains(&n) && !out.contains(&g.gid) {
                     out.push(g.gid);
                 }
             }

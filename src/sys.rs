@@ -5,7 +5,6 @@
 //! ACE_SETACL). Elsewhere a simulated backend is available for development
 //! by setting N4ACL_MOCK=<dir>.
 
-use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -39,7 +38,7 @@ mod native {
     }
 
     fn cpath(p: &Path) -> io::Result<CString> {
-        CString::new(p.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+        CString::new(p.as_os_str().as_bytes()).map_err(|_| io::Error::other("path contains a NUL byte"))
     }
 
     fn explain(e: io::Error) -> io::Error {
@@ -159,26 +158,6 @@ pub struct MountInfo {
     pub real_path: PathBuf,
 }
 
-fn unescape_mounts(s: &str) -> String {
-    // /proc/mounts escapes spaces as \040 etc.
-    let b = s.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\'
-            && i + 4 <= b.len()
-            && let Some(v) = std::str::from_utf8(&b[i + 1..i + 4]).ok().and_then(|d| u8::from_str_radix(d, 8).ok())
-        {
-            out.push(v);
-            i += 4;
-            continue;
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 fn mount_table() -> Vec<(String, PathBuf, String)> {
     if let Ok(t) = std::fs::read_to_string("/etc/mnttab") {
         return t
@@ -189,12 +168,13 @@ fn mount_table() -> Vec<(String, PathBuf, String)> {
             })
             .collect();
     }
+    // development hosts only; escaped paths are not decoded
     std::fs::read_to_string("/proc/mounts")
         .unwrap_or_default()
         .lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.split(' ').collect();
-            Some((unescape_mounts(f.first()?), PathBuf::from(unescape_mounts(f.get(1)?)), f.get(2)?.to_string()))
+            Some((f.first()?.to_string(), PathBuf::from(f.get(1)?), f.get(2)?.to_string()))
         })
         .collect()
 }
@@ -214,8 +194,10 @@ pub fn mount_info(path: &Path) -> MountInfo {
         if fstype == "lofs" && special.starts_with('/') {
             let rest = cur.strip_prefix(mp).unwrap_or(Path::new("")).to_path_buf();
             let next = PathBuf::from(special).join(rest);
-            if next == cur {
-                break;
+            // Inside a zone the lofs source is a global-zone path that is not
+            // visible here; stop instead of matching an unrelated mount.
+            if next == cur || std::fs::symlink_metadata(&next).is_err() {
+                return MountInfo { dataset: None, fstype: "lofs".into(), real_path: cur };
             }
             cur = next;
             continue;
@@ -306,8 +288,4 @@ pub fn guess_zone(real_path: &Path, dataset: Option<&str>, zoned: bool) -> Optio
         }
     }
     None
-}
-
-pub fn io_msg(e: &io::Error) -> String {
-    e.to_string()
 }

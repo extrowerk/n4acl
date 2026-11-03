@@ -31,7 +31,8 @@ n4acl --restore BACKUP
   -p PASSWD -g GROUP  resolve names with these files
   -G                  global zone
   -n                  numeric ids only
-  --dump              print the ACL in chmod A= syntax
+  --dump              print the ACL in chmod A= syntax (numeric ids unless
+                      names are resolved in the global zone)
   --explain           explain every entry and run the checks
   --test WHO          effective access for name | uid | uid:gid,gid…
   --restore FILE      re-apply ACLs from a backup
@@ -72,7 +73,9 @@ In the entry editor:
 - Arrow keys move between fields and Space toggles.
 - Permission letters (`rwxpdDaARWcCos`) toggle their permission directly.
 - `1`–`7` apply presets: full, modify, read+exec, read, write, traverse, none.
-- In the id field, Tab completes names from the current id context.
+- In the id field, Tab completes names from the current id context. Backspace (or ^H), Ctrl-u (clear) and
+  Ctrl-w (delete word) work in all text fields.
+- Editing an inherited (`I`) entry turns it into an explicit one, so a later "refresh inherited" keeps it.
 
 ## Writing
 
@@ -82,9 +85,15 @@ The write dialog shows a diff and offers three scopes:
 - **same ACL everywhere:** directories get the ACL as-is; files get it without `f`/`d`/`n`/`i` and without inherit-only entries.
 - **refresh inherited:** each child keeps its own entries, and its `I` entries are recomputed from the new parent ACL according to `aclinherit`.
 
-Recursion never follows symlinks and never crosses into another dataset. Dry run is available. Backups go
-to `~/.n4acl/` (override with `N4ACL_BACKUP_DIR`) and contain numeric ids. Before writing, n4acl re-reads the
-ACL and warns if someone else changed it after it was loaded.
+Recursion never follows symlinks and never crosses into another dataset; such entries are counted as
+skipped. Dry run is available. Backups go to `~/.n4acl/` (override with `N4ACL_BACKUP_DIR`):
+
+- They contain numeric ids and byte-exact paths, and are created with mode 0600.
+- Each entry is flushed before that item's ACL is changed, so an interrupted run can still be undone.
+- A backup with nothing in it is removed.
+
+Before writing, n4acl re-reads the ACL and warns if someone else changed it after it was loaded.
+If this item could not be written, your edits stay in the editor so you can fix them and retry.
 
 ## Checks
 

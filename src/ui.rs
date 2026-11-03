@@ -9,9 +9,10 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
-use std::os::unix::fs::MetadataExt;
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 
 pub struct Target {
@@ -22,6 +23,8 @@ pub struct Target {
     pub mode: u32,
     pub mount: MountInfo,
     pub props: ZfsProps,
+    /// set when the path was reached through a lofs mount
+    pub via_lofs: bool,
 }
 
 impl Target {
@@ -29,7 +32,8 @@ impl Target {
         let md = std::fs::metadata(&path)?;
         let mount = sys::mount_info(&path);
         let props = sys::zfs_props(mount.dataset.as_deref());
-        Ok(Target { is_dir: md.is_dir(), uid: md.uid(), gid: md.gid(), mode: md.mode() & 0o7777, path, mount, props })
+        let via_lofs = std::fs::canonicalize(&path).map(|c| c != mount.real_path).unwrap_or(false);
+        Ok(Target { is_dir: md.is_dir(), uid: md.uid(), gid: md.gid(), mode: md.mode() & 0o7777, path, mount, props, via_lofs })
     }
     fn refresh_meta(&mut self) {
         if let Ok(md) = std::fs::metadata(&self.path) {
@@ -38,6 +42,36 @@ impl Target {
             self.mode = md.mode() & 0o7777;
         }
     }
+}
+
+// ---------------------------------------------------------------- text input
+
+/// Many terminals send ^H for Backspace, which arrives as Ctrl+h.
+fn normalize(mut k: KeyEvent) -> KeyEvent {
+    if k.code == KeyCode::Char('h') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        k.code = KeyCode::Backspace;
+        k.modifiers.remove(KeyModifiers::CONTROL);
+    }
+    k
+}
+
+/// Single-line field editing. Returns true when the key was consumed.
+fn edit_text(s: &mut String, k: &KeyEvent) -> bool {
+    let chord = k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    match k.code {
+        KeyCode::Backspace => {
+            s.pop();
+        }
+        KeyCode::Char('u') if chord => s.clear(),
+        KeyCode::Char('w') if chord => {
+            let keep = s.trim_end().rfind([' ', ',', ':']).map_or(0, |i| i + 1);
+            s.truncate(keep);
+        }
+        KeyCode::Char(_) if chord => {} // swallow other control chords
+        KeyCode::Char(c) if !c.is_control() => s.push(c),
+        _ => return false,
+    }
+    true
 }
 
 // ---------------------------------------------------------------- editor
@@ -201,6 +235,10 @@ impl Editor {
         use Focus::*;
         self.error = None;
         let typing = self.focus == Name;
+        if typing && edit_text(&mut self.name, &k) {
+            self.comps.clear();
+            return None;
+        }
         match k.code {
             KeyCode::Esc => return Some(false),
             KeyCode::Enter => return Some(true),
@@ -225,15 +263,6 @@ impl Editor {
                     }
                     Name => {}
                 }
-            }
-            KeyCode::Backspace if typing => {
-                self.name.pop();
-                self.comps.clear();
-            }
-            KeyCode::Char('u') if typing && k.modifiers.contains(KeyModifiers::CONTROL) => self.name.clear(),
-            KeyCode::Char(c) if typing => {
-                self.name.push(c);
-                self.comps.clear();
             }
             KeyCode::Char(' ') => match self.focus {
                 Type => self.kind = (self.kind + 1) % 4,
@@ -316,7 +345,10 @@ pub struct App {
     status: Option<(String, bool)>,
     quit: bool,
     want_editor: bool,
+    /// text from a failed $EDITOR round, offered again on the next `v`
     editor_retry: Option<String>,
+    /// write job confirmed in the dialog; run after the "working" screen is drawn
+    pending: Option<ApplyView>,
     table: TableState,
 }
 
@@ -364,7 +396,7 @@ impl App {
         let global = (!ids.is_global()).then(|| IdDb::load(Source::Global));
         let mut table = TableState::default();
         table.select(Some(0));
-        App {
+        let mut app = App {
             t,
             ids,
             global,
@@ -379,8 +411,13 @@ impl App {
             quit: false,
             want_editor: false,
             editor_retry: None,
+            pending: None,
             table,
+        };
+        if let Some(w) = app.ids.warning.clone() {
+            app.set_status(w, true);
         }
+        app
     }
 
     fn modified(&self) -> bool {
@@ -403,6 +440,7 @@ impl App {
             self.undo.remove(0);
         }
         self.redo.clear();
+        self.editor_retry = None; // the failed text no longer matches the ACL
     }
 
     fn set_status(&mut self, s: impl Into<String>, err: bool) {
@@ -425,7 +463,7 @@ impl App {
                 self.orig = a;
                 self.t.refresh_meta();
                 self.clamp();
-                self.set_status("reloaded from disk", false);
+                self.set_status(if self.undo.is_empty() { "reloaded from disk" } else { "reloaded from disk (u to undo)" }, false);
             }
             Err(e) => self.set_status(format!("reload failed: {e}"), true),
         }
@@ -437,6 +475,7 @@ impl App {
         if k.kind != KeyEventKind::Press {
             return;
         }
+        let k = normalize(k);
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match std::mem::replace(&mut self.overlay, Overlay::None) {
             Overlay::None => {
@@ -446,9 +485,21 @@ impl App {
             Overlay::Edit(mut ed) => match ed.key(k, &self.ids) {
                 Some(true) => match ed.build(&self.ids) {
                     Ok(a) => {
-                        self.snapshot();
+                        if ed.index.is_none_or(|i| self.acl[i] != a) {
+                            self.snapshot();
+                        }
                         match ed.index {
-                            Some(i) => self.acl[i] = a,
+                            Some(i) if self.acl[i] == a => {}
+                            Some(i) => {
+                                let mut a = a;
+                                if a.has(INHERITED) {
+                                    // edited by hand: no longer an inherited copy, so a later
+                                    // "refresh inherited" on the parent will keep it
+                                    a.flags &= !INHERITED;
+                                    self.set_status("entry is now explicit (I flag cleared)", false);
+                                }
+                                self.acl[i] = a;
+                            }
                             None => {
                                 let at = ed.insert_at.min(self.acl.len());
                                 self.acl.insert(at, a);
@@ -464,22 +515,16 @@ impl App {
                 Some(false) => {}
                 None => self.overlay = Overlay::Edit(ed),
             },
-            Overlay::Test(mut tv) => match k.code {
-                KeyCode::Esc => {}
-                KeyCode::Enter => {
-                    tv.out = self.run_test(&tv.input);
-                    self.overlay = Overlay::Test(tv);
+            Overlay::Test(mut tv) => {
+                match k.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Enter => tv.out = self.run_test(&tv.input),
+                    _ => {
+                        edit_text(&mut tv.input, &k);
+                    }
                 }
-                KeyCode::Backspace => {
-                    tv.input.pop();
-                    self.overlay = Overlay::Test(tv);
-                }
-                KeyCode::Char(c) => {
-                    tv.input.push(c);
-                    self.overlay = Overlay::Test(tv);
-                }
-                _ => self.overlay = Overlay::Test(tv),
-            },
+                self.overlay = Overlay::Test(tv);
+            }
             Overlay::Apply(mut av) => {
                 let nscope = if self.t.is_dir { 3 } else { 1 };
                 match k.code {
@@ -503,44 +548,38 @@ impl App {
                 }
                 self.overlay = Overlay::Apply(av);
             }
-            Overlay::Pager { title, lines, mut scroll } => match k.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {}
-                KeyCode::Down | KeyCode::Char('j') => {
-                    scroll = scroll.saturating_add(1);
-                    self.overlay = Overlay::Pager { title, lines, scroll };
+            Overlay::Pager { title, lines, mut scroll } => {
+                let max = lines.len().saturating_sub(1) as u16;
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return,
+                    KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
+                    KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
+                    KeyCode::PageDown | KeyCode::Char(' ') => scroll = scroll.saturating_add(10),
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                    KeyCode::Home | KeyCode::Char('g') => scroll = 0,
+                    KeyCode::End | KeyCode::Char('G') => scroll = max,
+                    _ => {}
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    scroll = scroll.saturating_sub(1);
-                    self.overlay = Overlay::Pager { title, lines, scroll };
+                self.overlay = Overlay::Pager { title, lines, scroll: scroll.min(max) };
+            }
+            Overlay::Context { items, mut sel } => {
+                match k.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Up => sel = sel.saturating_sub(1),
+                    KeyCode::Down => sel = (sel + 1).min(items.len() - 1),
+                    KeyCode::Enter => {
+                        self.ids = IdDb::load(items[sel].1.clone());
+                        self.global = (!self.ids.is_global()).then(|| IdDb::load(Source::Global));
+                        match self.ids.warning.clone() {
+                            Some(w) => self.set_status(w, true),
+                            None => self.set_status(format!("names now resolved in {}", self.ids.describe()), false),
+                        }
+                        return;
+                    }
+                    _ => {}
                 }
-                KeyCode::PageDown | KeyCode::Char(' ') => {
-                    scroll = scroll.saturating_add(10);
-                    self.overlay = Overlay::Pager { title, lines, scroll };
-                }
-                KeyCode::PageUp => {
-                    scroll = scroll.saturating_sub(10);
-                    self.overlay = Overlay::Pager { title, lines, scroll };
-                }
-                _ => self.overlay = Overlay::Pager { title, lines, scroll },
-            },
-            Overlay::Context { items, mut sel } => match k.code {
-                KeyCode::Esc => {}
-                KeyCode::Up => {
-                    sel = sel.saturating_sub(1);
-                    self.overlay = Overlay::Context { items, sel };
-                }
-                KeyCode::Down => {
-                    sel = (sel + 1).min(items.len() - 1);
-                    self.overlay = Overlay::Context { items, sel };
-                }
-                KeyCode::Enter => {
-                    let src = items[sel].1.clone();
-                    self.ids = IdDb::load(src);
-                    self.global = (!self.ids.is_global()).then(|| IdDb::load(Source::Global));
-                    self.set_status(format!("names now resolved in {}", self.ids.describe()), false);
-                }
-                _ => self.overlay = Overlay::Context { items, sel },
-            },
+                self.overlay = Overlay::Context { items, sel };
+            }
             Overlay::ConfirmQuit => match k.code {
                 KeyCode::Char('y') | KeyCode::Char('q') => self.quit = true,
                 KeyCode::Char('w') => self.open_apply(),
@@ -651,9 +690,12 @@ impl App {
         for z in sys::zones() {
             items.push((format!("zone {}  ({})", z.name, z.root().display()), Source::Zone { name: z.name.clone(), root: z.root() }));
         }
+        if let Source::Files { .. } = &self.ids.source {
+            items.push((format!("files {}", self.ids.describe()), self.ids.source.clone()));
+        }
         items.push(("numeric only".into(), Source::Numeric));
         let cur = self.ids.describe();
-        let sel = items.iter().position(|(_, s)| IdDb::load(s.clone()).describe() == cur).unwrap_or(0);
+        let sel = items.iter().position(|(_, s)| s.describe() == cur).unwrap_or(0);
         self.overlay = Overlay::Context { items, sel };
     }
 
@@ -695,48 +737,69 @@ impl App {
         self.overlay = Overlay::Apply(ApplyView { scope: 0, dry: false, backup: true, focus: 0, diff: diff(&old, &new), force: false, msg: None });
     }
 
+    /// Validate the write dialog; on success the job runs from `tick()`
+    /// after a "working" screen has been drawn.
     fn do_apply(&mut self, mut av: ApplyView) {
         let scope = Scope::ALL[av.scope];
+        av.msg = None;
+        let refuse = |av: &mut ApplyView, m: String| av.msg = Some(m);
         if scope == Scope::This && !self.modified() {
-            av.msg = Some("no changes to write for this item".into());
-            self.overlay = Overlay::Apply(av);
-            return;
-        }
-        // detect changes made by someone else since we loaded
-        if !av.force && !av.dry {
+            refuse(&mut av, "no changes to write for this item".into());
+        } else if !self.t.is_dir && self.acl.iter().any(|a| a.has(FLAG_INHERIT_ANY | INHERIT_ONLY | NO_PROPAGATE)) {
+            refuse(&mut av, "files cannot carry f/d/i/n flags; remove them first".into());
+        } else if !av.force && !av.dry {
+            // detect changes made by someone else since we loaded
             match sys::get_acl(&self.t.path) {
                 Ok(cur) if cur != self.orig => {
                     av.force = true;
-                    av.msg = Some("ACL changed on disk since it was loaded! Enter again to overwrite, Esc then r to reload.".into());
-                    self.overlay = Overlay::Apply(av);
-                    return;
+                    refuse(&mut av, "ACL changed on disk since it was loaded! Enter again to overwrite, or Esc and r to reload.".into());
                 }
-                Err(e) => {
-                    av.msg = Some(format!("cannot re-read ACL: {e}"));
-                    self.overlay = Overlay::Apply(av);
-                    return;
-                }
+                Err(e) => refuse(&mut av, format!("cannot re-read ACL: {e}")),
                 _ => {}
             }
         }
+        if av.msg.is_some() {
+            self.overlay = Overlay::Apply(av); // keep the dialog open with the message
+            return;
+        }
+        let what = if av.dry { "checking" } else { "writing" };
+        self.overlay = Overlay::Pager { title: " working ".into(), lines: vec![Line::from(format!("{what} {} …", self.t.path.display()))], scroll: 0 };
+        self.pending = Some(av);
+    }
+
+    /// Run deferred work (called by the event loop after drawing).
+    pub fn tick(&mut self) {
+        let Some(av) = self.pending.take() else { return };
         let rep = apply::run(&apply::Job {
             root: &self.t.path,
             acl: &self.acl,
-            scope,
+            scope: Scope::ALL[av.scope],
             aclinherit: self.t.props.aclinherit.as_deref(),
             dry_run: av.dry,
             backup: av.backup,
         });
         let mut lines: Vec<Line<'static>> = Vec::new();
         let verb = if av.dry { "would change" } else { "changed" };
-        lines.push(Line::from(format!("{verb}: {}   unchanged: {}   errors: {}", rep.changed, rep.unchanged, rep.errors.len())).bold());
+        lines.push(
+            Line::from(format!(
+                "{verb}: {}   unchanged: {}   skipped: {}   errors: {}",
+                rep.changed,
+                rep.unchanged,
+                rep.skipped,
+                rep.errors.len()
+            ))
+            .bold(),
+        );
+        if rep.skipped > 0 {
+            lines.push(Line::from("skipped = symlinks, special files and other datasets below this one").dim());
+        }
         if let Some(b) = &rep.backup {
             lines.push(Line::from(format!("backup: {}", b.display())));
-            lines.push(Line::from(format!("restore: n4acl --restore {}", b.display())).dim());
+            lines.push(Line::from(format!("undo with: n4acl --restore {}", b.display())).dim());
         }
         if !rep.samples.is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::from("examples:"));
+            lines.push(Line::from(if av.dry { "would change, e.g.:" } else { "changed, e.g.:" }));
             for (p, o, n) in &rep.samples {
                 lines.push(Line::from(format!("  {}  ({o} → {n} entries)", p.display())));
             }
@@ -747,16 +810,26 @@ impl App {
             for (p, e) in rep.errors.iter().take(200) {
                 lines.push(Line::from(format!("  {}: {e}", p.display())).red());
             }
+            if rep.errors.len() > 200 {
+                lines.push(Line::from(format!("  … and {} more", rep.errors.len() - 200)).red());
+            }
         }
         if !av.dry {
+            let root_failed = rep.errors.iter().any(|(p, _)| p == &self.t.path);
             match sys::get_acl(&self.t.path) {
-                Ok(a) => {
-                    if a != self.acl {
+                Ok(disk) => {
+                    if root_failed {
+                        // keep the user's edits so they can be fixed and retried
                         lines.push(Line::from(""));
-                        lines.push(Line::from("note: ZFS stored a different ACL than requested (normalised by aclmode/aclinherit?)").yellow());
+                        lines.push(Line::from("this item was not written; your edits are kept").yellow());
+                    } else {
+                        if disk != self.acl {
+                            lines.push(Line::from(""));
+                            lines.push(Line::from("note: ZFS stored a different ACL than requested (aclmode/aclinherit?)").yellow());
+                        }
+                        self.acl = disk.clone();
                     }
-                    self.acl = a.clone();
-                    self.orig = a;
+                    self.orig = disk;
                     self.clamp();
                 }
                 Err(e) => lines.push(Line::from(format!("re-read failed: {e}")).red()),
@@ -767,40 +840,23 @@ impl App {
     }
 
     fn run_test(&self, input: &str) -> Vec<Line<'static>> {
-        let input = input.trim();
-        let (u, g) = match input.split_once(':') {
-            Some((u, g)) => (u, Some(g)),
-            None => (input, None),
-        };
-        let uid = match ace::resolve_user(u, &self.ids) {
-            Ok(x) => x,
+        let subj = match Subject::parse(input, &self.ids) {
+            Ok(s) => s,
             Err(e) => return vec![Line::from(e).red()],
         };
-        let gids: Vec<u32> = match g {
-            Some(g) => {
-                let mut v = Vec::new();
-                for x in g.split(',').filter(|s| !s.is_empty()) {
-                    match ace::resolve_group(x, &self.ids) {
-                        Ok(id) => v.push(id),
-                        Err(e) => return vec![Line::from(e).red()],
-                    }
-                }
-                v
-            }
-            None => self.ids.user_groups(uid),
-        };
+        let (uid, gids) = (subj.uid, &subj.gids);
         let gnames: Vec<String> =
             gids.iter().map(|g| self.ids.group_name(*g).map(|n| format!("{g}({n})")).unwrap_or(g.to_string())).collect();
         let mut out = vec![
             Line::from(format!("uid {uid}{}  groups: {}", self.ids.user_name(uid).map(|n| format!(" ({n})")).unwrap_or_default(), if gnames.is_empty() { "none".into() } else { gnames.join(" ") })),
             Line::from(""),
         ];
-        let res = model::evaluate(&self.acl, &Subject { uid, gids }, self.t.uid, self.t.gid);
+        let res = model::evaluate(&self.acl, &subj, self.t.uid, self.t.gid);
         for (p, d) in res {
             if p.bit == SYNCHRONIZE || (!self.t.is_dir && p.bit == DELETE_CHILD) {
                 continue;
             }
-            let label = format!("{:<22}", if self.t.is_dir { p.dir } else { p.file });
+            let label = format!("{:<17}", if self.t.is_dir { p.dir } else { p.file });
             let (mark, why, st) = match d {
                 Decision::Allowed(i) => ("✓", format!("allowed by #{} {}", i + 1, who_display(self.acl[i].who, &self.ids, self.names)), Style::new().green()),
                 Decision::Denied(i) => ("✗", format!("denied by #{} {}", i + 1, who_display(self.acl[i].who, &self.ids, self.names)), Style::new().red()),
@@ -819,7 +875,8 @@ impl App {
 
     fn edit_external(&mut self, term: &mut DefaultTerminal) {
         self.want_editor = false;
-        let tmp = std::env::temp_dir().join(format!("n4acl-{}.acl", std::process::id()));
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        let tmp = std::env::temp_dir().join(format!("n4acl-{}-{nanos:x}.acl", std::process::id()));
         let body = self.editor_retry.take().unwrap_or_else(|| {
             let mut s = format!(
                 "# ACL of {}\n# one entry per line, chmod A= syntax. Ids: name, number or #number ({}).\n# perms rwxpdDaARWcCos  flags fdinSFI  type allow|deny|audit|alarm\n",
@@ -832,20 +889,29 @@ impl App {
             }
             s
         });
-        if let Err(e) = std::fs::write(&tmp, &body) {
-            self.set_status(format!("cannot write temp file: {e}"), true);
+        // private, freshly created file: no symlink games in a shared /tmp
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(body.as_bytes()));
+        if let Err(e) = written {
+            self.set_status(format!("cannot create {}: {e}", tmp.display()), true);
             return;
         }
         ratatui::restore();
         let ed = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
         let status = std::process::Command::new("sh").arg("-c").arg(format!("{ed} \"$1\"")).arg("sh").arg(&tmp).status();
         *term = ratatui::init();
-        let text = std::fs::read_to_string(&tmp).unwrap_or_default();
+        let text = std::fs::read_to_string(&tmp);
         let _ = std::fs::remove_file(&tmp);
-        if !matches!(status, Ok(s) if s.success()) {
-            self.set_status("editor exited with an error; nothing changed", true);
-            return;
-        }
+        let text = match (status, text) {
+            (Ok(st), Ok(t)) if st.success() => t,
+            (Err(e), _) => return self.set_status(format!("cannot run '{ed}': {e}"), true),
+            (Ok(st), Ok(_)) => return self.set_status(format!("editor exited with {st}; nothing changed"), true),
+            (_, Err(e)) => return self.set_status(format!("cannot read back the edited file: {e}"), true),
+        };
         match ace::parse_acl(&text, &self.ids) {
             Ok(acl) if acl.is_empty() => self.set_status("empty ACL rejected; nothing changed", true),
             Ok(acl) => {
@@ -857,11 +923,20 @@ impl App {
                 }
             }
             Err(errs) => {
-                let mut s: String = errs.iter().map(|(l, e)| format!("# ERROR line {l}: {e}\n")).collect();
-                s.push_str(&text.lines().filter(|l| !l.starts_with("# ERROR")).collect::<Vec<_>>().join("\n"));
-                s.push('\n');
+                // put each message right above its line, replacing older ones
+                let mut s = String::new();
+                for (n, line) in text.lines().enumerate() {
+                    if line.starts_with("# ERROR") {
+                        continue;
+                    }
+                    for (_, e) in errs.iter().filter(|(l, _)| *l == n + 1) {
+                        s.push_str(&format!("# ERROR: {e}\n"));
+                    }
+                    s.push_str(line);
+                    s.push('\n');
+                }
                 self.editor_retry = Some(s);
-                self.set_status(format!("{} parse error(s): {} — press v to fix", errs.len(), errs[0].1), true);
+                self.set_status(format!("{} error(s), first: {} — press v to fix", errs.len(), errs[0].1), true);
             }
         }
     }
@@ -872,18 +947,25 @@ impl App {
         let area = f.area();
         let lints = model::lint(&self.acl, &self.ctx());
         let sel_lints: Vec<&model::Lint> = lints.iter().filter(|l| l.ace == Some(self.sel)).collect();
-        let other: Vec<&model::Lint> = lints.iter().filter(|l| l.ace != Some(self.sel) && l.sev == Severity::Warn || l.ace.is_none()).collect();
+        // checks pane: general notes plus warnings about other entries
+        let other: Vec<&model::Lint> =
+            lints.iter().filter(|l| l.ace.is_none() || (l.ace != Some(self.sel) && l.sev == Severity::Warn)).collect();
         let explain = if self.acl.is_empty() {
             vec![]
         } else {
             ace::explain(&self.acl[self.sel], self.t.is_dir, &self.ids, self.global.as_ref())
         };
-        let exp_h = (explain.len() + sel_lints.len()) as u16 + 2;
-        let lint_h = if other.is_empty() { 0 } else { other.len().min(3) as u16 + 2 };
+        let lint_h = other.len().min(3) as u16;
+        // explanation gets what the table does not need (wrapped lines estimated)
+        let inner_w = area.width.saturating_sub(2).max(1) as usize;
+        let want: usize = explain.iter().map(|l| l.chars().count().div_ceil(inner_w).max(1)).sum::<usize>() + sel_lints.len() + 2;
+        let table_need = self.acl.len() as u16 + 3;
+        let spare = area.height.saturating_sub(4 + 1 + lint_h + table_need);
+        let exp_h = (want as u16).min(spare.max(5)).min(12);
         let [head, body, exp, lnt, foot] = Layout::vertical([
-            Constraint::Length(5),
+            Constraint::Length(4),
             Constraint::Min(4),
-            Constraint::Length(exp_h.min(10)),
+            Constraint::Length(exp_h),
             Constraint::Length(lint_h),
             Constraint::Length(1),
         ])
@@ -906,7 +988,7 @@ impl App {
                 if p.props.zoned {
                     s.push_str("   zoned");
                 }
-                if p.mount.real_path != std::fs::canonicalize(&p.path).unwrap_or_default() {
+                if p.via_lofs {
                     s.push_str(&format!("   via lofs → {}", p.mount.real_path.display()));
                 }
                 Line::from(s)
@@ -924,7 +1006,8 @@ impl App {
             self.ids.short()
         ));
         f.render_widget(
-            Paragraph::new(vec![Line::from(l1), l2, l3]).block(Block::bordered().title(" n4acl ").title_style(Style::new().bold())),
+            Paragraph::new(vec![Line::from(l1), l2, l3])
+                .block(Block::new().borders(Borders::TOP).title(" n4acl ").title_style(Style::new().bold())),
             head,
         );
 
@@ -991,7 +1074,7 @@ impl App {
             if other.len() > 3 {
                 lt.last_mut().unwrap().push_span(Span::raw(format!("   (+{} more)", other.len() - 3)).dim());
             }
-            f.render_widget(Paragraph::new(lt).block(Block::bordered().title(" checks ")), lnt);
+            f.render_widget(Paragraph::new(lt), lnt);
         }
 
         // footer / status
@@ -999,7 +1082,7 @@ impl App {
             Some((s, true)) => Line::styled(s.clone(), Style::new().red().bold()),
             Some((s, false)) => Line::styled(s.clone(), Style::new().green()),
             None => Line::from(
-                "a add  e edit  x del  J/K move  y dup  u undo  t test  i inherit  v $EDITOR  N names  Z ids  w write  ? help  q quit",
+                "a add · e edit · x del · J/K move · t test · w write · ? help · q quit",
             )
             .dim(),
         };
@@ -1010,18 +1093,18 @@ impl App {
             Overlay::None => {}
             Overlay::Edit(ed) => self.draw_editor(f, ed),
             Overlay::Test(tv) => {
-                let r = popup(area, 84, tv.out.len() as u16 + 5);
+                let r = popup(area, 80, tv.out.len() as u16 + 5);
                 let mut lines = vec![
                     Line::from(vec![Span::raw("Who: "), Span::raw(tv.input.clone()).underlined(), Span::raw("▏")]),
-                    Line::from("  name | uid | uid:gid,gid…   Enter: evaluate   Esc: close").dim(),
+                    Line::from("  name | uid | user:group,group…  (list groups explicitly for LDAP users)").dim(),
                 ];
                 lines.extend(tv.out.iter().cloned());
                 f.render_widget(Clear, r);
-                f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" test access ")), r);
+                f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" test access ").title_bottom(" Enter evaluate · Esc close ")), r);
             }
             Overlay::Apply(av) => self.draw_apply(f, av),
             Overlay::Pager { title, lines, scroll } => {
-                let r = popup(area, 90, area.height.saturating_sub(2));
+                let r = popup(area, 84, area.height.saturating_sub(2));
                 f.render_widget(Clear, r);
                 f.render_widget(
                     Paragraph::new(lines.clone())
@@ -1058,8 +1141,6 @@ impl App {
 
     fn draw_editor(&self, f: &mut Frame, ed: &Editor) {
         let area = f.area();
-        let r = popup(area, 86, 22);
-        f.render_widget(Clear, r);
         let foc = |x: Focus| ed.focus == x;
         let hl = |on: bool, s: String| if on { Span::raw(s).reversed() } else { Span::raw(s) };
         let radio = |sel: bool| if sel { "(•)" } else { "( )" };
@@ -1124,7 +1205,7 @@ impl App {
         lines.push(Line::from(l));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::raw(format!(" {:<56}", "Permissions (press the letter to toggle)")).bold(),
+            Span::raw(format!(" {:<48}", "Permissions (letter key toggles)")).bold(),
             Span::raw("Inheritance").bold(),
         ]));
         let is_dir = self.t.is_dir;
@@ -1135,7 +1216,7 @@ impl App {
                 let p = PERMS.iter().find(|p| p.ch == ch).unwrap();
                 let on = ed.mask & p.bit != 0;
                 let desc = if is_dir { p.dir } else { p.file };
-                let s = format!("[{}] {} {:<22}", if on { "x" } else { " " }, ch, desc);
+                let s = format!("[{}] {} {:<16}", if on { "x" } else { " " }, ch, desc);
                 l.push(hl(foc(Focus::Grid(c, r)), s));
                 l.push(Span::raw("  "));
             }
@@ -1170,11 +1251,13 @@ impl App {
             Some(i) => format!(" edit entry #{} ", i + 1),
             None => format!(" new entry at #{} ", ed.insert_at + 1),
         };
+        let r = popup(area, 80, lines.len() as u16 + 2);
+        f.render_widget(Clear, r);
         f.render_widget(
             Paragraph::new(lines).block(
                 Block::bordered()
                     .title(title)
-                    .title_bottom(" ↑↓←→ move · Space toggle · 1-7 preset · Tab next/complete · Enter OK · Esc cancel "),
+                    .title_bottom(" arrows move · Space toggle · 1-7 preset · Tab complete · ⏎ OK · Esc cancel "),
             ),
             r,
         );
@@ -1215,7 +1298,7 @@ impl App {
         if let Some(m) = &av.msg {
             lines.push(Line::from(format!(" {m}")).yellow().bold());
         }
-        let r = popup(area, 92, lines.len() as u16 + 2);
+        let r = popup(area, 80, lines.len() as u16 + 2);
         f.render_widget(Clear, r);
         f.render_widget(
             Paragraph::new(Text::from(lines))
@@ -1296,6 +1379,10 @@ pub fn run(mut app: App) -> std::io::Result<()> {
             if let Event::Key(k) = event::read()? {
                 app.key(k);
             }
+            if app.pending.is_some() {
+                term.draw(|f| app.draw(f))?; // show "working" first
+                app.tick();
+            }
             if app.want_editor {
                 app.edit_external(&mut term);
             }
@@ -1347,6 +1434,7 @@ everyone@:------a-R-c--s:-------:allow",
             mode: 0o750,
             mount: MountInfo { dataset: Some("tank/zones/web01/data".into()), fstype: "zfs".into(), ..Default::default() },
             props: ZfsProps { aclmode: Some("restricted".into()), aclinherit: Some("passthrough".into()), zoned: false },
+            via_lofs: false,
         };
         let mut a = App::new(t, ids, acl);
         a.sel = 2;
@@ -1356,15 +1444,17 @@ everyone@:------a-R-c--s:-------:allow",
     #[test]
     fn render_main_and_overlays() {
         let mut a = demo();
-        println!("{}", snapshot(&mut a, 100, 30));
+        println!("{}", snapshot(&mut a, 80, 24));
         a.key(KeyEvent::from(KeyCode::Char('e')));
-        println!("{}", snapshot(&mut a, 100, 30));
+        let s = snapshot(&mut a, 80, 24);
+        println!("{s}");
+        assert!(s.contains("successful_access"), "flag column must fit in 80 columns");
         a.key(KeyEvent::from(KeyCode::Esc));
         a.key(KeyEvent::from(KeyCode::Char('t')));
-        println!("{}", snapshot(&mut a, 100, 30));
+        println!("{}", snapshot(&mut a, 80, 24));
         a.key(KeyEvent::from(KeyCode::Esc));
-        a.key(KeyEvent::from(KeyCode::Char('i')));
-        println!("{}", snapshot(&mut a, 100, 30));
+        a.key(KeyEvent::from(KeyCode::Char('w')));
+        println!("{}", snapshot(&mut a, 80, 24));
     }
 
     #[test]
@@ -1384,5 +1474,32 @@ everyone@:------a-R-c--s:-------:allow",
         a.key(KeyEvent::from(KeyCode::Char('u')));
         assert_eq!(a.acl.len(), n);
         assert!(!a.modified());
+    }
+
+    #[test]
+    fn backspace_as_ctrl_h() {
+        let mut a = demo();
+        a.key(KeyEvent::from(KeyCode::Char('a')));
+        for c in "12x".chars() {
+            a.key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        a.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)); // ^H
+        a.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)); // ignored chord
+        a.key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(a.acl[3].who, Who::User(12));
+    }
+
+    #[test]
+    fn editing_inherited_entry_makes_it_explicit() {
+        let mut a = demo();
+        a.sel = 5; // the I-flagged ephemeral entry is read-only…
+        a.key(KeyEvent::from(KeyCode::Char('e')));
+        assert!(matches!(a.overlay, Overlay::None));
+        a.acl[5].who = Who::User(5);
+        a.key(KeyEvent::from(KeyCode::Char('e')));
+        a.key(KeyEvent::from(KeyCode::Char('w'))); // toggle write
+        a.key(KeyEvent::from(KeyCode::Enter));
+        assert!(!a.acl[5].has(INHERITED));
+        assert!(a.acl[5].mask & WRITE_DATA != 0);
     }
 }
