@@ -2,6 +2,9 @@
 
 A small TUI editor for NFSv4 ACLs on **illumos ZFS** (built for OmniOS).
 
+<img width="1841" height="950" alt="image" src="https://github.com/user-attachments/assets/a03a3330-60ea-4761-9f19-61366dffbda1" />
+
+
 ```
 n4acl /tank/zones/web01/root/data/www
 ```
