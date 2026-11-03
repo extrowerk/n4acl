@@ -1,0 +1,20 @@
+[package]
+name = "n4acl"
+version = "0.1.0"
+edition = "2024"
+description = "TUI editor for NFSv4/ZFS ACLs on illumos"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+libc = "0.2"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(n4acl_check_illumos)'] }
